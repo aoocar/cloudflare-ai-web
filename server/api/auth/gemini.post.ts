@@ -1,13 +1,51 @@
-import {GenerateContentStreamResult, GoogleGenerativeAI, HarmBlockThreshold, HarmCategory} from '@google/generative-ai'
-import type {GeminiReq, VisionReq} from "~/utils/type";
+import {GoogleGenerativeAI, HarmBlockThreshold, HarmCategory} from '@google/generative-ai'
+import {headers} from '~/utils/helper';
+import {GeminiReq} from "~/utils/types";
 
-const genAI = new GoogleGenerativeAI(process.env.G_API_KEY!);
+const genAI = new GoogleGenerativeAI(process.env.G_API_KEY!)
 
-const headers = {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-}
+export default defineEventHandler(async (event) => {
+    const body: GeminiReq = await readBody(event)
+    const {model, messages} = body
+
+    const m = genAI.getGenerativeModel({model, safetySettings})
+    let msg = messages.slice(1)
+    let flag = ['user', 'assistant']
+    for (let i = 0; i < msg.length; i++) {
+        if (msg[i].role !== flag[i % 2]) {
+            flag = []
+            break
+        }
+    }
+    if (!flag.length) return new Response('对话失效，请重新开始对话', {status: 400})
+    const chat = m.startChat({
+        history: msg.slice(0, -1).map(m => ({
+            role: m.role === 'assistant' ? 'model' : m.role === 'user' ? 'user' : 'function',
+            parts: [{text: m.content}]
+        }))
+    })
+    const res = await chat.sendMessageStream(msg[msg.length - 1].content)
+
+    const textEncoder = new TextEncoder()
+    const readableStream = new ReadableStream({
+        async start(controller) {
+            for await (const chunk of res.stream) {
+                try {
+                    controller.enqueue(textEncoder.encode(chunk.text()))
+                } catch (e) {
+                    console.error(e)
+                    controller.enqueue(textEncoder.encode('已触发安全限制，请重新开始对话'))
+                }
+            }
+
+            controller.close()
+        }
+    })
+
+    return new Response(readableStream, {
+        headers,
+    })
+})
 
 const safetySettings = [
     {
@@ -31,72 +69,3 @@ const safetySettings = [
         threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH,
     }
 ]
-
-export default defineEventHandler(async (event) => {
-    const model = getQuery(event).model as string
-    let result: GenerateContentStreamResult
-
-    if (model === 'gemini-pro') {
-        const body: GeminiReq = await readBody(event)
-        const {history, msg, safeReply} = body
-        let modelParams
-        safeReply ? modelParams = {model} : modelParams = {model, safetySettings}
-        const m = genAI.getGenerativeModel(modelParams);
-        const chat = m.startChat({
-            history,
-        })
-        result = await chat.sendMessageStream(msg)
-    }
-
-    const encoder = new TextEncoder();
-    const readableStream = new ReadableStream({
-        async start(controller) {
-            if (model === 'gemini-pro-vision') {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({response: 'pending'})}\n\n`));
-
-                const multipartFormData = await readMultipartFormData(event)
-
-                let prompt, modelParams
-                const imageParts: VisionReq[] = []
-                multipartFormData?.map(d => {
-                    switch (d.name) {
-                        case 'prompt':
-                            prompt = d.data.toString()
-                            break;
-
-                        case 'images':
-                            imageParts.push({
-                                inlineData: {
-                                    data: d.data.toString('base64'),
-                                    mimeType: d.type!
-                                }
-                            })
-                            break;
-
-                        case 'safeReply':
-                            d.data.toString() === 'true' ? modelParams = {model} : modelParams = {model, safetySettings}
-                            break
-                    }
-                })
-                const m = genAI.getGenerativeModel(modelParams!);
-                if (prompt) {
-                    result = await m.generateContentStream([prompt, ...imageParts])
-                }
-            }
-
-            for await (const chunk of result.stream) {
-                let res
-                try {
-                    res = chunk.text()
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(res)}\n\n`));
-                } catch (e) {
-                    console.error(e)
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({error: e})}\n\n`))
-                }
-            }
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-            controller.close();
-        },
-    });
-    return new Response(readableStream, {headers})
-})
